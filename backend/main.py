@@ -93,7 +93,7 @@ def search(query: str, top_k: int = 3) -> list[dict]:
 def build_prompt(question: str, chunks: list[dict]) -> str:
     context_parts = []
     for chunk in chunks:
-        context_parts.append(f"[来源: {chunk['filename']}]\n{chunk['text']}")
+        context_parts.append(f"{chunk['text']}")
     context = "\n\n---\n\n".join(context_parts)
     prompt = f"""你是一个专业的文档分析助手。请根据以下参考资料回答用户的问题。
 

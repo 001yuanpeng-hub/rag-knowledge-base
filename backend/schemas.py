@@ -9,3 +9,5 @@ class ChatResponse(BaseModel):
     question: str
     answer: str
     references: list[str]
+
+
