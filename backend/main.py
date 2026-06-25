@@ -122,7 +122,7 @@ def build_prompt(question: str, chunks: list[dict]) -> str:
 @app.get("/history/")
 async def get_history():
     db = SessionLocal()
-    records = db.query(models.ChatHistory).order_by(models.ChatHistory.created_at.desc()).all()
+    records = db.query(models.ChatHistory).order_by(models.ChatHistory.created_at.asc()).all()
     db.close()
 
     return [

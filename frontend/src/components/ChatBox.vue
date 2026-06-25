@@ -220,8 +220,24 @@ function handleClickOutside(e) {
   }
 }
 
+async function loadHistory() {
+  try {
+    const res = await axios.get('/api/history/')
+    const history = res.data
+    for (const record of history) {
+      messages.value.push(
+        { role: 'user', content: record.question },
+        { role: 'ai', content: record.answer }
+      )
+    }
+  } catch (err) {
+    console.error('加载历史记录失败:', err)
+  }
+}
+
 onMounted(() => {
   document.addEventListener('click', handleClickOutside)
+  loadHistory()
 })
 
 onUnmounted(() => {
