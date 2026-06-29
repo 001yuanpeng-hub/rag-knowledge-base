@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from PyPDF2 import PdfReader
@@ -15,12 +15,14 @@ import os
 import json
 import redis
 import hashlib
+import time
 
 load_dotenv()
 
 app = FastAPI()
 
-redis_client = redis.from_url("redis://localhost:6379/0", decode_responses=True)
+redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+redis_client = redis.from_url(redis_url, decode_responses=True)
 
 # 模型配置（都是 Anthropic 兼容 API）
 MODEL_CONFIGS = {
@@ -113,10 +115,10 @@ def build_prompt(question: str, chunks: list[dict]) -> str:
 - 只有当参考资料完全无关时，才说"未找到相关内容，建议换个方式提问"
 - 对于日常问候(如 hello、你好),自然回应即可
 
-参考资料：
-{context}
+参考资料:{context}
+用户问题:{question}
 
-用户问题：{question}"""
+"""
     return prompt
 
 
@@ -131,6 +133,16 @@ async def create_conversation(request: schemas.ConversationCreate):
         db.add(conv)
         db.commit()
         db.refresh(conv)
+
+        redis_client.hset(
+            f"conv:{conv.id}", mapping={
+                "title": conv.title,
+                "created_at": conv.created_at.isoformat()
+            }
+        )
+
+        redis_client.sadd("conv:ids", conv.id)
+        redis_client.zadd("conv:active", {conv.id: time.time()})
         return {
             "id": conv.id,
             "title": conv.title,
@@ -143,15 +155,34 @@ async def create_conversation(request: schemas.ConversationCreate):
 async def list_conversations():
     db = SessionLocal()
     try:
-        convs = db.query(models.Conversation).order_by(models.Conversation.created_at.desc()).all()
-        return [
-            {
-                "id": c.id,
-                "title": c.title,
-                "created_at": c.created_at.isoformat()
-            }
-            for c in convs
-        ]
+        convs = []
+        try:
+            ids = redis_client.zrevrange("conv:active", 0, -1)
+            if ids:
+                for id in ids:
+                    try:
+                        conv = redis_client.hgetall(f"conv:{id}")
+                        if conv:
+                            convs.append({
+                                "id": int(id),
+                                "title": conv["title"],
+                                "created_at": conv["created_at"]
+                            })
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        if not convs:
+            convs = db.query(models.Conversation).order_by(models.Conversation.created_at.desc()).all()
+            return [
+                {
+                    "id": c.id,
+                    "title": c.title,
+                    "created_at": c.created_at.isoformat()
+                }
+                for c in convs
+            ]
+        return convs
     finally:
         db.close()
 
@@ -159,6 +190,20 @@ async def list_conversations():
 async def get_conversation_messages(conversation_id: int):
     db = SessionLocal()
     try:
+        try:
+            redis_client.zadd("conv:active", {conversation_id:time.time()})
+        except Exception:
+            pass
+
+        try:
+            cached = redis_client.lrange(f'conv:{conversation_id}:messages', 0, -1)
+            if cached:
+                messages = [json.loads(msg) for msg in cached]
+                messages.reverse()
+                return messages
+        except Exception:
+            pass
+
         conv = db.query(models.Conversation).filter(models.Conversation.id == conversation_id).first()
         if not conv:
             raise HTTPException(status_code=404, detail="对话不存在")
@@ -186,6 +231,11 @@ async def delete_conversation(conversation_id: int):
             raise HTTPException(status_code=404, detail="对话不存在")
         db.delete(conv)
         db.commit()
+
+        redis_client.delete(f"conv:{conversation_id}")
+        redis_client.srem("conv:ids", conversation_id)
+        redis_client.delete(f"conv:{conversation_id}:messages")
+        redis_client.zrem("conv:active", conversation_id)
         return {"message": "已删除"}
     finally:
         db.close()
@@ -199,6 +249,7 @@ async def rename_conversation(conversation_id: int, request: schemas.Conversatio
             raise HTTPException(status_code=404, detail="对话不存在")
         conv.title = request.title
         db.commit()
+        redis_client.hset(f"conv:{conversation_id}", "title", request.title)
         return {"id": conv.id, "title": conv.title, "created_at": conv.created_at.isoformat()}
     finally:
         db.close()
@@ -272,10 +323,10 @@ async def chat(request: schemas.ChatRequest):
         db.close()
 
 @app.post("/chat/stream/")
-async def chat_stream(request: schemas.ChatRequest):
-    question = request.question
-    model_name = request.model or "mimo"
-    conversation_id = request.conversation_id
+async def chat_stream(body: schemas.ChatRequest, request: Request):
+    question = body.question
+    model_name = body.model or "mimo"
+    conversation_id = body.conversation_id
 
     db = SessionLocal()
 
@@ -288,7 +339,29 @@ async def chat_stream(request: schemas.ChatRequest):
         db.refresh(conv)
         conversation_id = conv.id
 
+        redis_client.hset(
+            f"conv:{conv.id}", mapping={
+                "title": conv.title,
+                "created_at": conv.created_at.isoformat()
+            }
+        )
+        redis_client.sadd("conv:ids", conv.id)
+        redis_client.zadd("conv:active", {conv.id: time.time()})
+
     db.close()
+
+    ip = request.client.host
+    rate_key = "rate:" + ip
+    try:
+        count = redis_client.incr(rate_key)
+        if count == 1:
+            redis_client.expire(rate_key, 60)
+        if count > 10:
+            raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
     cache_key = "chat:" + hashlib.md5(question.encode()).hexdigest()
 
@@ -298,9 +371,16 @@ async def chat_stream(request: schemas.ChatRequest):
         cached = None
 
     if cached:
+        import asyncio
         async def return_cached():
-            yield f'data: {{"text": "{cached.decode()}", "done": false}}\n\n'
-            yield f'data: {{"text": "", "done": true, "conversation_id": {conversation_id}}}\n\n'
+            text = cached
+            # 每次发 5 个字，模拟流式
+            for i in range(0, len(text), 5):
+                chunk = json.dumps({"text": text[i:i+5], "done": False})
+                yield f"data: {chunk}\n\n"
+                await asyncio.sleep(0.03)
+            done = json.dumps({"text": "", "done": True, "conversation_id": conversation_id})
+            yield f"data: {done}\n\n"
         return StreamingResponse(
             return_cached(),
             media_type="text/event-stream",
@@ -358,6 +438,14 @@ async def chat_stream(request: schemas.ChatRequest):
                 conversation_id=conversation_id
             ))
             db.commit()
+
+            redis_client.lpush(f"conv:{conversation_id}:messages", json.dumps({'role': 'user', 'content': question}))
+            redis_client.lpush(f"conv:{conversation_id}:messages", json.dumps({'role': 'assistant', 'content': full_answer}))
+            redis_client.ltrim(f"conv:{conversation_id}:messages", 0, 49)
+
+        except Exception:
+            pass
+
         finally:
             db.close()
 
